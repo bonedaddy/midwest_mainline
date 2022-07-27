@@ -120,13 +120,11 @@ pub struct DhtServer {
     requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
     hash_table: Arc<RwLock<HashMap<InfoHash, Vec<CompactPeerContact>>>>,
     token_pool: Arc<TokenPool>,
-    socket: Arc<UdpSocket>,
 }
 
 impl DhtServer {
     pub(crate) fn new(
         requests: Receiver<(Krpc, SocketAddrV4)>,
-        socket: Arc<UdpSocket>,
         id: NodeId,
         routing_table: Arc<RwLock<RoutingTable>>,
     ) -> Self {
@@ -134,7 +132,6 @@ impl DhtServer {
             requests: Mutex::new(requests),
             hash_table: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
-            socket,
             our_id: id,
             routing_table,
         }

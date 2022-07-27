@@ -16,17 +16,19 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
+    sync::{mpsc, RwLock},
     task::{Builder, JoinError, JoinSet},
     time::{error::Elapsed, timeout},
 };
 
-use crate::message::TransactionId;
+use crate::dht_service::message_broker::UdpMessageDemultiplexer;
 use dht_client::DhtClientV4;
+use message_broker::MessageBroker;
 use tracing::{info, info_span, instrument, trace, warn, Instrument};
 
 pub mod dht_client;
 pub mod dht_server;
+pub(crate) mod message_broker;
 mod transaction_id_pool;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
@@ -36,7 +38,7 @@ mod transaction_id_pool;
 pub struct DhtV4 {
     client: Arc<DhtClientV4>,
     server: Arc<DhtServer>,
-    demultiplexer: Arc<MessageDemultiplexer>,
+    message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
     routing_table: Arc<RwLock<RoutingTable>>,
     helper_tasks: JoinSet<()>,
 }
@@ -54,65 +56,6 @@ impl Display for DhtServiceFailure {
 }
 
 impl Error for DhtServiceFailure {}
-
-/// A message demultiplexer keeps reading Krpc messages from a queue and place them either into the
-/// server response queue when we haven't seen this transaction id before, or into a oneshot channel
-/// so the client and await the response.
-#[derive(Debug)]
-pub(crate) struct MessageDemultiplexer {
-    /// a map to keep track of the responses we await from the client
-    pending_responses: Mutex<HashMap<TransactionId, Sender<Krpc>>>,
-
-    /// all messages belong to the server are put into this queue.
-    query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
-
-    /// a channel to receive new krpc read from the socket
-    incoming_messages: Mutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>,
-}
-
-impl MessageDemultiplexer {
-    pub fn new(
-        incoming_queue: mpsc::Receiver<(Krpc, SocketAddrV4)>,
-        query_channel: mpsc::Sender<(Krpc, SocketAddrV4)>,
-    ) -> Self {
-        Self {
-            pending_responses: Mutex::new(HashMap::new()),
-            query_queue: Mutex::new(query_channel),
-            incoming_messages: Mutex::new(incoming_queue),
-        }
-    }
-
-    #[instrument(skip_all)]
-    pub async fn run(&self) {
-        let mut incoming_messages = self.incoming_messages.lock().await;
-        while let Some((msg, socket_addr)) = incoming_messages.recv().await {
-            let id = msg.transaction_id();
-            trace!("received message for transaction id {:?}", hex::encode_upper(&*id));
-
-            // see if we have a slot for this transaction id, if we do, that means one of the
-            // messages that we expect, otherwise the message is a query we need to handle
-            if let Some(sender) = self.pending_responses.lock().await.remove(id) {
-                // failing means we're no longer interested, which is ok
-                let _ = sender.send(msg);
-            } else {
-                self.query_queue
-                    .lock()
-                    .await
-                    .send((msg, socket_addr))
-                    .await
-                    .expect("the server died before the demultiplexer could send the message");
-            }
-        }
-    }
-
-    /// Tell the placer we should expect some messages
-    pub async fn register(&self, transaction_id: TransactionId, sending_half: oneshot::Sender<Krpc>) {
-        let mut guard = self.pending_responses.lock().await;
-        // it's possible that the response never came and we a new request is now using the same
-        // transaction id
-        let _ = guard.insert(transaction_id, sending_half);
-    }
-}
 
 impl From<std::io::Error> for DhtServiceFailure {
     fn from(error: std::io::Error) -> Self {
@@ -185,7 +128,7 @@ impl DhtV4 {
         known_nodes: Vec<SocketAddrV4>,
     ) -> Result<Self, DhtServiceFailure> {
         let socket = UdpSocket::bind(&bind_addr).await?;
-        let socket = Arc::new(socket);
+        // let socket = Arc::new(socket);
 
         // id is randomly generated according to BEP-42
         let our_id = random_idv4(&external_addr, rand::thread_rng().gen::<u8>());
@@ -200,60 +143,18 @@ impl DhtV4 {
         // all queries that servers should handle are sent on this channel
         let (queries_tx, queries_rx) = mpsc::channel(1024);
 
-        // keep reading from sockets and place them on a queue for another task to place them into
-        // the right slot
-        let reading_socket = socket.clone();
-        let socket_reader = async move {
-            let mut buf = [0u8; 1500];
-            loop {
-                let (amount, socket_addr) = reading_socket
-                    .recv_from(&mut buf)
-                    .await
-                    .expect("common MTU 1500 exceeded");
-                trace!("packet from {socket_addr}");
-                if let Ok(msg) = bendy::serde::from_bytes::<Krpc>(&buf[..amount]) {
-                    let socket_addr = {
-                        match socket_addr {
-                            SocketAddr::V4(addr) => addr,
-                            _ => panic!("Expected V4 socket address"),
-                        }
-                    };
+        // all outgoing messages are sent on this channel
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
 
-                    incoming_packets_tx.send((msg, socket_addr)).await.unwrap();
-                } else {
-                    warn!(
-                        "Failed to parse message from {socket_addr}, bytes = {:?}",
-                        &buf[..amount]
-                    );
-                }
-            }
-        };
+        let udp_message_demultiplexer = UdpMessageDemultiplexer::new(socket, outgoing_rx, incoming_packets_tx);
 
-        join_set
-            .build_task()
-            .name(&*format!("socket reader for {bind_addr}"))
-            .spawn(socket_reader.instrument(info_span!("socket reader")));
-
-        let demultiplexer = MessageDemultiplexer::new(incoming_packets_rx, queries_tx);
-        let demultiplexer = Arc::new(demultiplexer);
-
-        let demultiplexer_clone = demultiplexer.clone();
-        join_set
-            .build_task()
-            .name(&*format!("message demultiplexer for {bind_addr}"))
-            .spawn(async move {
-                demultiplexer_clone.run().await;
-            });
+        let message_broker =
+            MessageBroker::new(incoming_packets_rx, queries_tx, outgoing_tx, udp_message_demultiplexer);
+        let message_broker = Arc::new(message_broker);
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(&our_id)));
 
-        let client = DhtClientV4::new(
-            bind_addr,
-            socket.clone(),
-            demultiplexer.clone(),
-            routing_table.clone(),
-            our_id,
-        );
+        let client = DhtClientV4::new(bind_addr, message_broker.clone(), routing_table.clone(), our_id);
         let client = Arc::new(client);
 
         // ask all the known nodes for ourselves
@@ -286,7 +187,7 @@ impl DhtV4 {
         let dht = DhtV4 {
             client: client.clone(),
             server: server.clone(),
-            demultiplexer,
+            message_broker,
             routing_table: routing_table.clone(),
 
             helper_tasks: join_set,
@@ -314,7 +215,8 @@ impl DhtV4 {
 
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
-            dht.send_message(&query, &contact)
+            dht.message_broker
+                .send(query, contact)
                 .await
                 .expect("failure to send message")
         })

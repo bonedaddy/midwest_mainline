@@ -1,5 +1,9 @@
 use crate::{
-    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
+    dht_service::{
+        message_broker::{MessageBroker, UdpMessageDemultiplexer},
+        transaction_id_pool::TransactionIdPool,
+        DhtServiceFailure,
+    },
     domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
     message::{InfoHash, Krpc},
     routing::RoutingTable,
@@ -10,72 +14,63 @@ use either::Either;
 use num::BigUint;
 use std::{
     collections::HashSet,
-    error::Error,
-    fmt::{Display, Formatter},
     net::SocketAddrV4,
     ops::{BitXor, DerefMut},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    net::UdpSocket,
     sync::{oneshot, oneshot::Sender, Mutex, RwLock},
     task::JoinError,
     time::timeout,
 };
 use tracing::{debug, info, instrument, trace, warn};
 
+use thiserror::Error;
 #[derive(Debug)]
 pub struct DhtClientV4 {
-    pub(crate) socket: Arc<UdpSocket>,
     pub(crate) our_id: [u8; 20],
-    pub(crate) demultiplexer: Arc<MessageDemultiplexer>,
+    pub(crate) message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: TransactionIdPool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RecursiveSearchError {
+    #[error("Failed to send search request:")]
     BottomedOut,
+    #[error("search cancelled")]
     Cancelled,
-    JoinError,
-    DhtServiceFailure,
+    #[error("failure when trying to join")]
+    JoinError(#[from] JoinError),
+    #[error("failed to send search request: {0}")]
+    RequestError(#[from] RequestError),
 }
 
-impl From<DhtServiceFailure> for RecursiveSearchError {
-    fn from(_: DhtServiceFailure) -> Self {
-        RecursiveSearchError::DhtServiceFailure
-    }
-}
+#[derive(Debug, Error)]
+pub enum RequestError {
+    #[error("timed out")]
+    TimedOut(#[from] tokio::time::error::Elapsed),
 
-impl From<JoinError> for RecursiveSearchError {
-    fn from(_: JoinError) -> Self {
-        RecursiveSearchError::JoinError
-    }
-}
+    #[error("failed to send ping")]
+    SendError(#[from] crate::dht_service::message_broker::SendMessageError),
 
-impl Display for RecursiveSearchError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
+    #[error("wrong response to ping query {0}")]
+    WrongResponse(String),
 }
-
-impl Error for RecursiveSearchError {}
 
 impl DhtClientV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     pub(crate) fn new(
         bind_addr: SocketAddrV4,
-        socket: Arc<UdpSocket>,
-        demultiplexer: Arc<MessageDemultiplexer>,
+        message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
         routing_table: Arc<RwLock<RoutingTable>>,
         our_id: NodeId,
     ) -> Self {
         DhtClientV4 {
-            socket,
-            demultiplexer,
+            message_broker,
             our_id,
             routing_table,
             socket_address: bind_addr,
@@ -83,26 +78,12 @@ impl DhtClientV4 {
         }
     }
 
-    /// Send a message out and await for a response.
-    ///
-    /// It does not alter the routing table, callers must decide what to do with the response.
-    pub async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
-        let (tx, rx) = oneshot::channel();
-
-        if let Ok(bytes) = bendy::serde::to_bytes(message) {
-            self.demultiplexer.register(message.transaction_id().clone(), tx).await;
-            self.socket.send_to(&bytes, recipient).await?;
-        }
-        let response = rx.await.unwrap();
-        Ok(response)
-    }
-
-    pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
+    pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), RequestError> {
         let this = &self;
         let transaction_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(Box::new(transaction_id.to_be_bytes()), this.our_id);
 
-        let response = self.send_message(&ping_msg, &recipient).await?;
+        let response = self.message_broker.send(ping_msg, recipient).await?;
 
         return if let Krpc::PingAnnouncePeerResponse(response) = response {
             this.routing_table
@@ -113,9 +94,7 @@ impl DhtClientV4 {
             Ok(())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
-            Err(DhtServiceFailure {
-                message: "Unexpected response to ping".to_string(),
-            })
+            Err(RequestError::WrongResponse(format!("{:?}", response)))
         };
     }
 
@@ -126,14 +105,14 @@ impl DhtClientV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: NodeId,
-    ) -> Result<Vec<CompactNodeContact>, DhtServiceFailure> {
+    ) -> Result<Vec<CompactNodeContact>, RequestError> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
         let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        let response = timeout(time_out, self.message_broker.send(query, interlocutor)).await??;
 
         if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
             // the nodes come back as one giant byte string, each 26 bytes is a node
@@ -154,9 +133,7 @@ impl DhtClientV4 {
 
             Ok(nodes)
         } else {
-            Err(DhtServiceFailure {
-                message: "Did not get an find node response".to_string(),
-            })
+            Err(RequestError::WrongResponse(format!("wrong response{:?}", response)))
         }
     }
 
@@ -170,7 +147,7 @@ impl DhtClientV4 {
             Option<Box<[u8]>>,
             Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
         ),
-        DhtServiceFailure,
+        RequestError,
     > {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
@@ -179,7 +156,7 @@ impl DhtClientV4 {
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        let response = timeout(time_out, self.message_broker.send(query, interlocutor)).await??;
         return match response {
             Krpc::GetPeersDeferredResponse(response) => {
                 // make sure we don't get duplicate nodes
@@ -232,15 +209,11 @@ impl DhtClientV4 {
             }
             Krpc::ErrorResponse(response) => {
                 warn!("Got an error response to get peers: {:?}", response);
-                Err(DhtServiceFailure {
-                    message: "Got an error response to get peers".to_string(),
-                })
+                Err(RequestError::WrongResponse(format!("{:?}", response)))
             }
             other => {
                 warn!("Unexpected response to get peers: {:?}", other);
-                Err(DhtServiceFailure {
-                    message: "Unexpected response to get peers".to_string(),
-                })
+                Err(RequestError::WrongResponse(format!("{:?}", other)))
             }
         };
     }
@@ -543,7 +516,7 @@ impl DhtClientV4 {
         info_hash: InfoHash,
         port: Option<u16>,
         token: Box<[u8]>,
-    ) -> Result<(), DhtServiceFailure> {
+    ) -> Result<(), RequestError> {
         let transaction_id = self.transaction_id_pool.next();
         let query = if let Some(port) = port {
             Krpc::new_announce_peer_query(
@@ -565,16 +538,16 @@ impl DhtClientV4 {
             )
         };
 
-        let response = self.send_message(&query, &recipient).await?;
+        let response = self.message_broker.send(query, recipient).await?;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
-            Krpc::ErrorResponse(err) => Err(DhtServiceFailure {
-                message: format!("node responded with an error to our announce peer request {err:?}"),
-            }),
-            _ => Err(DhtServiceFailure {
-                message: "non-compliant response from DHT node".to_string(),
-            }),
+            Krpc::ErrorResponse(err) => Err(RequestError::WrongResponse(format!(
+                "node responded with an error to our announce peer request {err:?}"
+            ))),
+            _ => Err(RequestError::WrongResponse(
+                "non-compliant response from DHT node".to_string(),
+            )),
         };
     }
 }

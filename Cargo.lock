@@ -1125,6 +1125,7 @@ dependencies = [
  "serde_unit_struct",
  "serde_with",
  "sha3",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
